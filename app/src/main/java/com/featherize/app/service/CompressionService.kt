@@ -48,7 +48,7 @@ class CompressionService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val total = CompressionQueue.items.value.size
-        startForeground(NOTIFICATION_ID, buildProgressNotification(0, total, ""))
+        startForeground(NOTIFICATION_ID, buildProgressNotification(0, total, "Préparation…", 0f))
         scope.launch {
             runCompression()
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -71,13 +71,14 @@ class CompressionService : Service() {
 
         items.forEachIndexed { index, item ->
             CompressionQueue.update(item.uri) { it.copy(status = CompressionStatus.RUNNING, progress = 0f) }
-            updateNotification(buildProgressNotification(index, items.size, item.displayName))
+            updateNotification(buildProgressNotification(index, items.size, item.displayName, 0f))
             try {
                 val outputFile = repository.cacheOutputFile(item.displayName, item.type)
                 when (item.type) {
                     MediaType.IMAGE -> imageCompressor.compress(item.uri, preset, outputFile)
                     MediaType.VIDEO -> videoCompressor.compress(item.uri, preset, outputFile) { progress ->
                         CompressionQueue.update(item.uri) { it.copy(progress = progress) }
+                        updateNotification(buildProgressNotification(index, items.size, item.displayName, progress))
                     }
                 }
                 Log.d(TAG, "service: done ${item.displayName} (${outputFile.length()} bytes)")
@@ -118,12 +119,14 @@ class CompressionService : Service() {
         return PendingIntent.getActivity(this, 0, intent, flags)
     }
 
-    private fun buildProgressNotification(index: Int, total: Int, currentName: String): Notification {
+    private fun buildProgressNotification(index: Int, total: Int, currentName: String, itemProgress: Float): Notification {
+        val safeTotal = total.coerceAtLeast(1)
+        val percent = (((index + itemProgress) / safeTotal) * 100).toInt().coerceIn(0, 100)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Compression en cours ($index/$total)")
+            .setContentTitle("Compression en cours (${index + 1}/$total)")
             .setContentText(currentName)
-            .setProgress(total.coerceAtLeast(1), index, false)
+            .setProgress(100, percent, false)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(contentIntent())
