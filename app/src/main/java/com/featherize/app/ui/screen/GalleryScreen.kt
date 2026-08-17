@@ -95,6 +95,7 @@ fun GalleryScreen(
     onStart: () -> Unit,
 ) {
     var showAllFilesDialog by remember { mutableStateOf(false) }
+    var showStartConfirmDialog by remember { mutableStateOf(false) }
 
     if (showAllFilesDialog) {
         AllFilesAccessDialog(
@@ -104,6 +105,18 @@ fun GalleryScreen(
                 onOpenAllFilesAccessSettings()
             },
             onDismiss = { showAllFilesDialog = false },
+        )
+    }
+
+    if (showStartConfirmDialog) {
+        StartConfirmDialog(
+            count = selected.size,
+            preset = preset,
+            onConfirm = {
+                showStartConfirmDialog = false
+                onStart()
+            },
+            onDismiss = { showStartConfirmDialog = false },
         )
     }
 
@@ -180,7 +193,7 @@ fun GalleryScreen(
                         Spacer(Modifier.height(6.dp))
                         PresetSelector(selected = preset, onSelect = onPresetChange, modifier = Modifier.fillMaxWidth())
                         Spacer(Modifier.height(12.dp))
-                        Button(onClick = onStart, modifier = Modifier.fillMaxWidth()) {
+                        Button(onClick = { showStartConfirmDialog = true }, modifier = Modifier.fillMaxWidth()) {
                             Text("Compresser ${selected.size} fichier(s)")
                         }
                     }
@@ -374,6 +387,29 @@ private fun EmptyGalleryState(modifier: Modifier = Modifier) {
             )
         }
     }
+}
+
+@Composable
+private fun StartConfirmDialog(
+    count: Int,
+    preset: CompressionPreset,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Filled.PlayCircle, contentDescription = null) },
+        title = { Text("Lancer la compression ?") },
+        text = {
+            Text("$count fichier(s) vont être compressés avec le preset \"${preset.label}\".")
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Compresser") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Annuler") }
+        },
+    )
 }
 
 @Composable
