@@ -7,6 +7,7 @@ import android.content.IntentSender
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.PowerManager
 import android.provider.MediaStore
 import androidx.annotation.RequiresApi
 import com.featherize.app.domain.GalleryMedia
@@ -39,6 +40,16 @@ class MediaRepository(private val context: Context) {
     fun hasManageExternalStorage(): Boolean =
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()
 
+    /**
+     * True once the user has exempted the app from battery optimization. Some OEM battery
+     * managers (MIUI, EMUI, Samsung...) kill foreground services during long background
+     * compressions despite the wake lock unless the app is explicitly whitelisted.
+     */
+    fun isIgnoringBatteryOptimizations(): Boolean {
+        val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        return powerManager.isIgnoringBatteryOptimizations(context.packageName)
+    }
+
     /** Queries every image and video visible to the app across shared storage, newest first. */
     fun queryAllMedia(): List<GalleryMedia> {
         val items = mutableListOf<GalleryMedia>()
@@ -51,10 +62,22 @@ class MediaRepository(private val context: Context) {
             MediaStore.Files.FileColumns.DATE_ADDED,
             MediaStore.Files.FileColumns.DATE_MODIFIED,
         )
-        val selection = "${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?"
+        // RAW formats (DNG, CR2, NEF, ARW, RAF...) are classified as images by MediaStore but
+        // aren't decodable by ImageDecoder/BitmapFactory — exclude them here so users never pick
+        // a file that's guaranteed to fail after the batch has already started.
+        val selection = "(${MediaStore.Files.FileColumns.MEDIA_TYPE} = ? OR " +
+            "${MediaStore.Files.FileColumns.MEDIA_TYPE} = ?) AND " +
+            "${MediaStore.Files.FileColumns.MIME_TYPE} NOT IN (?, ?, ?, ?, ?, ?, ?)"
         val selectionArgs = arrayOf(
             MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
             MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(),
+            "image/x-adobe-dng",
+            "image/x-canon-cr2",
+            "image/x-canon-crw",
+            "image/x-nikon-nef",
+            "image/x-sony-arw",
+            "image/x-fuji-raf",
+            "image/x-panasonic-raw",
         )
         val sortOrder = "${MediaStore.Files.FileColumns.DATE_ADDED} DESC"
 
@@ -95,6 +118,14 @@ class MediaRepository(private val context: Context) {
     }
 
     /**
+     * Compressed outputs otherwise accumulate forever in [Context.getCacheDir] — nothing else
+     * deletes them. Called after each successful export and on app startup (crash/kill leftovers).
+     */
+    fun clearCompressedCache() {
+        File(context.cacheDir, "compressed").listFiles()?.forEach { it.delete() }
+    }
+
+    /**
      * Publishes a compressed file back to shared storage via MediaStore.
      * [replace] deletes/overwrites the original entry; otherwise a new item is created.
      */
@@ -112,9 +143,22 @@ class MediaRepository(private val context: Context) {
         val displayName = compressedFile.name
 
         if (mode == ExportMode.REPLACE) {
-            val out = resolver.openOutputStream(item.uri, "wt")
-                ?: error("Impossible d'ouvrir le fichier original en écriture")
-            out.use { compressedFile.inputStream().use { input -> input.copyTo(it) } }
+            // "wt" truncates the original immediately, so an interrupted write (disk full, app
+            // killed) can leave it corrupted. There's no atomic swap available through
+            // ContentResolver for an existing MediaStore entry, so the achievable mitigation is:
+            // don't delete compressedFile until the caller confirms EXPORTED (see
+            // CompressionViewModel.exportOne), giving a recovery path even if this throws.
+            try {
+                val out = resolver.openOutputStream(item.uri, "wt")
+                    ?: error("Impossible d'ouvrir le fichier original en écriture")
+                out.use { compressedFile.inputStream().use { input -> input.copyTo(it) } }
+            } catch (t: Throwable) {
+                throw IllegalStateException(
+                    "Échec du remplacement, l'original peut être corrompu. Le fichier compressé est " +
+                        "conservé et l'export sera retenté.",
+                    t,
+                )
+            }
             return item.uri
         }
 

@@ -18,10 +18,13 @@ class ImageCompressor(private val context: Context) {
         val bitmap = decodeModern(sourceUri, preset.imageMaxDimension)
             ?: decodeLegacy(sourceUri, preset.imageMaxDimension)
 
-        FileOutputStream(outputFile).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.JPEG, preset.imageJpegQuality, out)
+        try {
+            FileOutputStream(outputFile).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, preset.imageJpegQuality, out)
+            }
+        } finally {
+            bitmap.recycle()
         }
-        bitmap.recycle()
 
         return outputFile
     }

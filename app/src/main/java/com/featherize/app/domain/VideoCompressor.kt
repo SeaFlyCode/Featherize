@@ -59,6 +59,10 @@ class VideoCompressor(private val context: Context) {
         decoder.start()
 
         val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        // The decode→encode path is surface-to-surface and never rotates pixels, so the source's
+        // rotation hint (how portrait video ends up stored as landscape + a "rotate on playback"
+        // flag) must be copied through explicitly, or every portrait video plays back sideways.
+        muxer.setOrientationHint(inputVideoFormat.getInteger(MediaFormat.KEY_ROTATION, 0))
 
         var muxerVideoTrack = -1
         var muxerAudioTrack = -1
@@ -140,7 +144,7 @@ class VideoCompressor(private val context: Context) {
         check(muxerStarted) { "Échec de l'encodage : aucun flux vidéo produit" }
 
         if (audioTrackIndex >= 0) {
-            copyAudioTrack(sourceUri, audioTrackIndex, muxer, muxerAudioTrack)
+            copyAudioTrack(sourceUri, audioTrackIndex, muxer, muxerAudioTrack, onProgress)
         }
 
         muxer.stop()
@@ -151,11 +155,17 @@ class VideoCompressor(private val context: Context) {
         return outputFile
     }
 
+    /**
+     * Runs after the video track is fully muxed, so it's reported as the last 95-100% of
+     * [onProgress] — without this, a video with a long audio track leaves the notification
+     * looking frozen at 95% while this synchronous copy loop runs.
+     */
     private fun copyAudioTrack(
         sourceUri: Uri,
         audioTrackIndex: Int,
         muxer: MediaMuxer,
         muxerTrack: Int,
+        onProgress: (Float) -> Unit,
     ) {
         val audioExtractor = MediaExtractor()
         context.contentResolver.openFileDescriptor(sourceUri, "r")?.use { pfd ->
@@ -167,6 +177,9 @@ class VideoCompressor(private val context: Context) {
         val maxSize = if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
             format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
         } else DEFAULT_BUFFER_SIZE
+        val audioDurationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
+            format.getLong(MediaFormat.KEY_DURATION)
+        } else 1L
         val buffer = java.nio.ByteBuffer.allocate(maxSize)
         val bufferInfo = MediaCodec.BufferInfo()
 
@@ -178,6 +191,10 @@ class VideoCompressor(private val context: Context) {
             bufferInfo.presentationTimeUs = audioExtractor.sampleTime
             bufferInfo.flags = audioExtractor.sampleFlags
             muxer.writeSampleData(muxerTrack, buffer, bufferInfo)
+            if (audioDurationUs > 0) {
+                val audioProgress = bufferInfo.presentationTimeUs.toFloat() / audioDurationUs
+                onProgress((0.95f + 0.05f * audioProgress).coerceIn(0.95f, 1f))
+            }
             audioExtractor.advance()
         }
         audioExtractor.release()
