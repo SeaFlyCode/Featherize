@@ -24,6 +24,7 @@ import com.featherize.app.domain.applyFilters
 import com.featherize.app.domain.applySort
 import com.featherize.app.domain.toMediaItem
 import com.featherize.app.service.CompressionQueue
+import com.featherize.app.service.CompressionQueueApi
 import com.featherize.app.service.CompressionService
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -52,6 +53,8 @@ data class UiState(
     val sizeFilter: SizeFilter = SizeFilter.ALL,
     val sortOption: SortOption = SortOption.DATE_NEWEST,
     val manageStorageGranted: Boolean = false,
+    val batteryOptimizationIgnored: Boolean = false,
+    val isExporting: Boolean = false,
 ) {
     val filteredGalleryMedia: List<GalleryMedia>
         get() = galleryMedia.applyFilters(typeFilter, sizeFilter).applySort(sortOption)
@@ -59,15 +62,18 @@ data class UiState(
 
 private const val TAG = "Featherize"
 
-class CompressionViewModel(application: Application) : AndroidViewModel(application) {
+class CompressionViewModel(
+    application: Application,
+    private val queue: CompressionQueueApi = CompressionQueue,
+) : AndroidViewModel(application) {
 
     private val repository = MediaRepository(application)
 
     private val _uiState = MutableStateFlow(
         UiState(
-            items = CompressionQueue.items.value,
-            isProcessing = CompressionQueue.isRunning.value,
-            screen = if (CompressionQueue.isRunning.value) ScreenState.PROGRESS else ScreenState.PICKING,
+            items = queue.items.value,
+            isProcessing = queue.isRunning.value,
+            screen = if (queue.isRunning.value) ScreenState.PROGRESS else ScreenState.PICKING,
         ),
     )
     val uiState: StateFlow<UiState> = _uiState
@@ -81,21 +87,26 @@ class CompressionViewModel(application: Application) : AndroidViewModel(applicat
         // lifecycle — we just mirror its state so the UI stays live (and picks the right
         // screen back up if the app was left mid-compression and comes back later).
         viewModelScope.launch {
-            CompressionQueue.items.collect { items -> _uiState.update { it.copy(items = items) } }
+            queue.items.collect { items -> _uiState.update { it.copy(items = items) } }
         }
         viewModelScope.launch {
-            CompressionQueue.isRunning.collect { running -> _uiState.update { it.copy(isProcessing = running) } }
+            queue.isRunning.collect { running -> _uiState.update { it.copy(isProcessing = running) } }
         }
         viewModelScope.launch {
-            CompressionQueue.batchCompleted.collect {
+            queue.batchCompleted.collect {
                 _uiState.update { it.copy(screen = ScreenState.RESULT) }
             }
         }
         refreshManageStorageStatus()
+        refreshBatteryOptimizationStatus()
     }
 
     fun refreshManageStorageStatus() {
         _uiState.update { it.copy(manageStorageGranted = repository.hasManageExternalStorage()) }
+    }
+
+    fun refreshBatteryOptimizationStatus() {
+        _uiState.update { it.copy(batteryOptimizationIgnored = repository.isIgnoringBatteryOptimizations()) }
     }
 
     fun onWritePermissionResult(granted: Boolean) {
@@ -156,44 +167,56 @@ class CompressionViewModel(application: Application) : AndroidViewModel(applicat
             .filter { it.uri in state.selectedUris }
             .map { it.toMediaItem() }
 
-        CompressionQueue.start(selectedItems, state.preset)
+        queue.start(selectedItems, state.preset)
         _uiState.update { it.copy(screen = ScreenState.PROGRESS) }
 
         val context = getApplication<Application>()
         ContextCompat.startForegroundService(context, Intent(context, CompressionService::class.java))
     }
 
+    /** Takes effect once the file currently compressing finishes — see CompressionService. */
+    fun cancelCompression() {
+        queue.requestCancel()
+    }
+
     fun exportResults() {
-        val mode = _uiState.value.exportMode
-        val doneItems = _uiState.value.items.filter { it.status == CompressionStatus.DONE && it.compressedFile != null }
+        val state = _uiState.value
+        if (state.isExporting) return
+        val mode = state.exportMode
+        val doneItems = state.items.filter { it.status == CompressionStatus.DONE && it.compressedFile != null }
         if (doneItems.isEmpty()) return
 
+        _uiState.update { it.copy(isExporting = true) }
         viewModelScope.launch {
-            // Android 11+ can ask for write access to every replaced file in one dialog, instead
-            // of a RecoverableSecurityException prompt per item — and with "all files access"
-            // granted, no prompt is needed at all.
-            val needsConsent = mode == ExportMode.REPLACE &&
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
-                !repository.hasManageExternalStorage()
-            if (needsConsent) {
-                val granted = requestBatchWriteConsent(doneItems.map { it.uri })
-                if (!granted) {
-                    doneItems.forEach { item ->
-                        updateItem(item.uri) { it.copy(errorMessage = "Permission refusée pour modifier ces fichiers") }
+            try {
+                // Android 11+ can ask for write access to every replaced file in one dialog, instead
+                // of a RecoverableSecurityException prompt per item — and with "all files access"
+                // granted, no prompt is needed at all.
+                val needsConsent = mode == ExportMode.REPLACE &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                    !repository.hasManageExternalStorage()
+                if (needsConsent) {
+                    val granted = requestBatchWriteConsent(doneItems.map { it.uri })
+                    if (!granted) {
+                        doneItems.forEach { item ->
+                            updateItem(item.uri) { it.copy(errorMessage = "Permission refusée pour modifier ces fichiers") }
+                        }
+                        return@launch
                     }
-                    return@launch
                 }
-            }
-            for (item in doneItems) {
-                val file = item.compressedFile ?: continue
-                exportOne(item, file, mode)
-            }
+                for (item in doneItems) {
+                    val file = item.compressedFile ?: continue
+                    exportOne(item, file, mode)
+                }
 
-            val allSucceeded = doneItems.all { done ->
-                val current = _uiState.value.items.find { it.uri == done.uri }
-                current?.status == CompressionStatus.EXPORTED && current.errorMessage == null
+                val allSucceeded = doneItems.all { done ->
+                    val current = _uiState.value.items.find { it.uri == done.uri }
+                    current?.status == CompressionStatus.EXPORTED && current.errorMessage == null
+                }
+                if (allSucceeded) reset()
+            } finally {
+                _uiState.update { it.copy(isExporting = false) }
             }
-            if (allSucceeded) reset()
         }
     }
 
@@ -215,7 +238,10 @@ class CompressionViewModel(application: Application) : AndroidViewModel(applicat
         try {
             val resultUri = withContext(Dispatchers.IO) { repository.export(item, file, mode) }
             Log.d(TAG, "exported ${item.displayName} -> $resultUri")
-            updateItem(item.uri) { it.copy(status = CompressionStatus.EXPORTED, resultUri = resultUri) }
+            file.delete()
+            updateItem(item.uri) {
+                it.copy(status = CompressionStatus.EXPORTED, resultUri = resultUri, compressedFile = null)
+            }
         } catch (e: SecurityException) {
             val intentSender = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 recoverableWriteIntentSender(e)
@@ -239,7 +265,10 @@ class CompressionViewModel(application: Application) : AndroidViewModel(applicat
             try {
                 val resultUri = withContext(Dispatchers.IO) { repository.export(item, file, mode) }
                 Log.d(TAG, "exported after consent ${item.displayName} -> $resultUri")
-                updateItem(item.uri) { it.copy(status = CompressionStatus.EXPORTED, resultUri = resultUri) }
+                file.delete()
+                updateItem(item.uri) {
+                    it.copy(status = CompressionStatus.EXPORTED, resultUri = resultUri, compressedFile = null)
+                }
             } catch (t: Throwable) {
                 Log.e(TAG, "export retry failed for ${item.displayName}", t)
                 updateItem(item.uri) { it.copy(errorMessage = t.message ?: "Échec de l'export") }

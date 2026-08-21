@@ -1,14 +1,18 @@
 package com.featherize.app
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
+import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.collectAsState
@@ -42,6 +46,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The app is always dark (FeatherizeTheme has no light variant), so the system-bar icons
+        // must be forced light regardless of the device's own light/dark setting — SystemBarStyle
+        // .auto() would otherwise pick dark icons on a light-system device, invisible over our
+        // permanently dark background.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+        )
 
         val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
             val readGranted = results.entries.any {
@@ -80,19 +92,23 @@ class MainActivity : ComponentActivity() {
                             media = uiState.filteredGalleryMedia,
                             selected = uiState.selectedUris,
                             preset = uiState.preset,
+                            exportMode = uiState.exportMode,
                             permissionGranted = uiState.permissionGranted,
                             isLoading = uiState.isLoadingGallery,
                             typeFilter = uiState.typeFilter,
                             sizeFilter = uiState.sizeFilter,
                             sortOption = uiState.sortOption,
                             manageStorageGranted = uiState.manageStorageGranted,
+                            batteryOptimizationIgnored = uiState.batteryOptimizationIgnored,
                             onPresetChange = viewModel::setPreset,
+                            onExportModeChange = viewModel::setExportMode,
                             onToggle = viewModel::toggleSelection,
                             onRequestPermission = { permissionLauncher.launch(mediaPermissions) },
                             onTypeFilterChange = viewModel::setTypeFilter,
                             onSizeFilterChange = viewModel::setSizeFilter,
                             onSortOptionChange = viewModel::setSortOption,
                             onOpenAllFilesAccessSettings = { openAllFilesAccessSettings() },
+                            onOpenBatteryOptimizationSettings = { openBatteryOptimizationSettings() },
                             onStart = viewModel::startCompression,
                         )
                     }
@@ -100,14 +116,14 @@ class MainActivity : ComponentActivity() {
                         // No BackHandler: compression runs in CompressionService independent of
                         // this Activity, so leaving the app (or pressing back) is safe — it just
                         // keeps going in the background with its own notification.
-                        ProgressScreen(items = uiState.items)
+                        ProgressScreen(items = uiState.items, onCancel = viewModel::cancelCompression)
                     }
                     ScreenState.RESULT -> {
                         BackHandler(enabled = true) { viewModel.reset() }
                         ResultScreen(
                             items = uiState.items,
                             exportMode = uiState.exportMode,
-                            onExportModeChange = viewModel::setExportMode,
+                            isExporting = uiState.isExporting,
                             onExport = viewModel::exportResults,
                             onDone = viewModel::reset,
                         )
@@ -120,11 +136,20 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         viewModel.refreshManageStorageStatus()
+        viewModel.refreshBatteryOptimizationStatus()
     }
 
     private fun openAllFilesAccessSettings() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = Uri.parse("package:$packageName")
+        }
+        startActivity(intent)
+    }
+
+    @SuppressLint("BatteryLife")
+    private fun openBatteryOptimizationSettings() {
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
             data = Uri.parse("package:$packageName")
         }
         startActivity(intent)

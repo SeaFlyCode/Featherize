@@ -15,7 +15,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -36,7 +35,7 @@ import com.featherize.app.ui.component.formatSavings
 fun ResultScreen(
     items: List<MediaItem>,
     exportMode: ExportMode,
-    onExportModeChange: (ExportMode) -> Unit,
+    isExporting: Boolean,
     onExport: () -> Unit,
     onDone: () -> Unit,
 ) {
@@ -74,23 +73,12 @@ fun ResultScreen(
                 }
             }
 
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                FilterChip(
-                    selected = exportMode == ExportMode.COPY,
-                    onClick = { onExportModeChange(ExportMode.COPY) },
-                    label = { Text("Nouvelle copie") },
-                )
-                FilterChip(
-                    selected = exportMode == ExportMode.REPLACE,
-                    onClick = { onExportModeChange(ExportMode.REPLACE) },
-                    label = { Text("Remplacer l'original") },
-                )
-            }
+            Text(
+                if (exportMode == ExportMode.REPLACE) "Mode : remplacer l'original" else "Mode : nouvelle copie",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
 
             LazyColumn(
                 modifier = Modifier.weight(1f),
@@ -112,8 +100,8 @@ fun ResultScreen(
                 OutlinedButton(onClick = onDone, modifier = Modifier.weight(1f)) {
                     Text("Nouvelle compression")
                 }
-                Button(onClick = onExport, modifier = Modifier.weight(1f)) {
-                    Text(if (alreadyExported) "Exporté ✓" else "Exporter")
+                Button(onClick = onExport, enabled = !isExporting, modifier = Modifier.weight(1f)) {
+                    Text(if (alreadyExported) "Exporté ✓" else if (isExporting) "Export…" else "Exporter")
                 }
             }
         }

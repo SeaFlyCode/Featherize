@@ -27,6 +27,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.BatteryFull
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
@@ -64,6 +66,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
 import coil3.request.ImageRequest
+import com.featherize.app.data.ExportMode
 import com.featherize.app.domain.CompressionPreset
 import com.featherize.app.domain.GalleryMedia
 import com.featherize.app.domain.MediaType
@@ -79,22 +82,27 @@ fun GalleryScreen(
     media: List<GalleryMedia>,
     selected: Set<Uri>,
     preset: CompressionPreset,
+    exportMode: ExportMode,
     permissionGranted: Boolean,
     isLoading: Boolean,
     typeFilter: MediaTypeFilter,
     sizeFilter: SizeFilter,
     sortOption: SortOption,
     manageStorageGranted: Boolean,
+    batteryOptimizationIgnored: Boolean,
     onPresetChange: (CompressionPreset) -> Unit,
+    onExportModeChange: (ExportMode) -> Unit,
     onToggle: (Uri) -> Unit,
     onRequestPermission: () -> Unit,
     onTypeFilterChange: (MediaTypeFilter) -> Unit,
     onSizeFilterChange: (SizeFilter) -> Unit,
     onSortOptionChange: (SortOption) -> Unit,
     onOpenAllFilesAccessSettings: () -> Unit,
+    onOpenBatteryOptimizationSettings: () -> Unit,
     onStart: () -> Unit,
 ) {
     var showAllFilesDialog by remember { mutableStateOf(false) }
+    var showBatteryDialog by remember { mutableStateOf(false) }
     var showStartConfirmDialog by remember { mutableStateOf(false) }
 
     if (showAllFilesDialog) {
@@ -108,10 +116,22 @@ fun GalleryScreen(
         )
     }
 
+    if (showBatteryDialog) {
+        BatteryOptimizationDialog(
+            granted = batteryOptimizationIgnored,
+            onOpenSettings = {
+                showBatteryDialog = false
+                onOpenBatteryOptimizationSettings()
+            },
+            onDismiss = { showBatteryDialog = false },
+        )
+    }
+
     if (showStartConfirmDialog) {
         StartConfirmDialog(
             count = selected.size,
             preset = preset,
+            exportMode = exportMode,
             onConfirm = {
                 showStartConfirmDialog = false
                 onStart()
@@ -129,6 +149,16 @@ fun GalleryScreen(
                     },
                     actions = {
                         if (permissionGranted) {
+                            IconButton(onClick = { showBatteryDialog = true }) {
+                                Icon(
+                                    imageVector = if (batteryOptimizationIgnored) {
+                                        Icons.Filled.BatteryFull
+                                    } else {
+                                        Icons.Filled.BatteryAlert
+                                    },
+                                    contentDescription = "Optimisation batterie",
+                                )
+                            }
                             IconButton(onClick = { showAllFilesDialog = true }) {
                                 Icon(
                                     imageVector = if (manageStorageGranted) Icons.Filled.LockOpen else Icons.Filled.Lock,
@@ -192,6 +222,25 @@ fun GalleryScreen(
                         )
                         Spacer(Modifier.height(6.dp))
                         PresetSelector(selected = preset, onSelect = onPresetChange, modifier = Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            "Destination",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FilterChip(
+                                selected = exportMode == ExportMode.COPY,
+                                onClick = { onExportModeChange(ExportMode.COPY) },
+                                label = { Text("Nouvelle copie") },
+                            )
+                            FilterChip(
+                                selected = exportMode == ExportMode.REPLACE,
+                                onClick = { onExportModeChange(ExportMode.REPLACE) },
+                                label = { Text("Remplacer l'original") },
+                            )
+                        }
                         Spacer(Modifier.height(12.dp))
                         Button(onClick = { showStartConfirmDialog = true }, modifier = Modifier.fillMaxWidth()) {
                             Text("Compresser ${selected.size} fichier(s)")
@@ -393,21 +442,64 @@ private fun EmptyGalleryState(modifier: Modifier = Modifier) {
 private fun StartConfirmDialog(
     count: Int,
     preset: CompressionPreset,
+    exportMode: ExportMode,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val modeLabel = if (exportMode == ExportMode.REPLACE) "en remplaçant l'original" else "dans une nouvelle copie"
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Filled.PlayCircle, contentDescription = null) },
         title = { Text("Lancer la compression ?") },
         text = {
-            Text("$count fichier(s) vont être compressés avec le preset \"${preset.label}\".")
+            Text("$count fichier(s) vont être compressés avec le preset \"${preset.label}\", $modeLabel.")
         },
         confirmButton = {
             TextButton(onClick = onConfirm) { Text("Compresser") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Annuler") }
+        },
+    )
+}
+
+@Composable
+private fun BatteryOptimizationDialog(
+    granted: Boolean,
+    onOpenSettings: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Icon(
+                if (granted) Icons.Filled.BatteryFull else Icons.Filled.BatteryAlert,
+                contentDescription = null,
+            )
+        },
+        title = { Text(if (granted) "Optimisation batterie désactivée" else "Éviter les compressions interrompues") },
+        text = {
+            Text(
+                if (granted) {
+                    "Featherize peut compresser de gros fichiers en arrière-plan sans que le système ne l'arrête."
+                } else {
+                    "Sur certains téléphones (Xiaomi, Huawei, Samsung...), le système peut arrêter la " +
+                        "compression des gros fichiers si l'écran reste éteint longtemps. Exclue Featherize " +
+                        "de l'optimisation de batterie pour l'éviter."
+                },
+            )
+        },
+        confirmButton = {
+            if (!granted) {
+                TextButton(onClick = onOpenSettings) { Text("Ouvrir les réglages") }
+            } else {
+                TextButton(onClick = onDismiss) { Text("OK") }
+            }
+        },
+        dismissButton = {
+            if (!granted) {
+                TextButton(onClick = onDismiss) { Text("Plus tard") }
+            }
         },
     )
 }
