@@ -64,8 +64,10 @@ private const val TAG = "Featherize"
 
 class CompressionViewModel(
     application: Application,
-    private val queue: CompressionQueueApi = CompressionQueue,
+    private val queue: CompressionQueueApi,
 ) : AndroidViewModel(application) {
+
+    constructor(application: Application) : this(application, CompressionQueue)
 
     private val repository = MediaRepository(application)
 
