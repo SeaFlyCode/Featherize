@@ -48,4 +48,4 @@ L'app demande l'accès aux médias (`READ_MEDIA_IMAGES`, `READ_MEDIA_VIDEO`) et 
 
 ## Licence
 
-Distribué sous licence [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) — voir [LICENSE](LICENSE). Usage et modification libres, republication des versions dérivées sous la même licence obligatoire, usage commercial soumis à autorisation.
+Distribué sous licence [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html) avec la [Commons Clause](https://commonsclause.com/) — voir [LICENSE](LICENSE). Usage, modification et redistribution libres, y compris pour un usage en réseau/SaaS (copyleft AGPL : toute modification exposée via un service doit être republiée) ; vendre le logiciel lui-même ou un service dont la valeur en dérive substantiellement nécessite une autorisation commerciale.
