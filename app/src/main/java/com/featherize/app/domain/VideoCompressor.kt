@@ -7,6 +7,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
+import android.os.Build
 import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
@@ -54,8 +55,37 @@ class VideoCompressor(private val context: Context) {
         val inputSurface = encoder.createInputSurface()
         encoder.start()
 
+        // The output format above never carries HDR color metadata (BT.2020/PQ/HLG) — H.264
+        // baseline output is implicitly SDR/BT.709. Left alone, a decoder fed an HDR source
+        // (e.g. this device's 8K capture) hands the encoder raw HDR pixel data with nothing
+        // downstream describing it as such: a technically-valid but incoherent stream that some
+        // decoders (the system thumbnail extractor observed via
+        // "MediaMetadataRetrieverJNI: getFrameAtTime: videoFrame is a NULL pointer") fail to read
+        // a frame from — which is what was making MediaProvider treat freshly-exported compressed
+        // videos as unreadable and prune them from MediaStore right after indexing them. Request
+        // SDR tone-mapping on the decoder so the surface handed to the encoder is coherent SDR.
+        val sourceTransfer = if (inputVideoFormat.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) {
+            inputVideoFormat.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
+        } else {
+            -1
+        }
+        val isHdrSource = sourceTransfer == MediaFormat.COLOR_TRANSFER_ST2084 ||
+            sourceTransfer == MediaFormat.COLOR_TRANSFER_HLG
         val decoder = MediaCodec.createDecoderByType(inputVideoFormat.getString(MediaFormat.KEY_MIME)!!)
-        decoder.configure(inputVideoFormat, inputSurface, null, 0)
+        if (isHdrSource && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Not every decoder honors this request the same way; if configure() rejects it
+            // outright, fall back to the plain format rather than losing the whole export.
+            val toneMappedFormat = MediaFormat(inputVideoFormat).apply {
+                setInteger(MediaFormat.KEY_COLOR_TRANSFER_REQUEST, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+            }
+            try {
+                decoder.configure(toneMappedFormat, inputSurface, null, 0)
+            } catch (t: Throwable) {
+                decoder.configure(inputVideoFormat, inputSurface, null, 0)
+            }
+        } else {
+            decoder.configure(inputVideoFormat, inputSurface, null, 0)
+        }
         decoder.start()
 
         val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -67,6 +97,8 @@ class VideoCompressor(private val context: Context) {
         var muxerVideoTrack = -1
         var muxerAudioTrack = -1
         var muxerStarted = false
+        var videoSamplesWritten = 0
+        var decoderFramesRendered = 0
 
         extractor.selectTrack(videoTrackIndex)
         val bufferInfo = MediaCodec.BufferInfo()
@@ -94,12 +126,23 @@ class VideoCompressor(private val context: Context) {
                 val outIndex = decoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
                 if (outIndex >= 0) {
                     val eos = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-                    decoder.releaseOutputBuffer(outIndex, bufferInfo.size > 0)
+                    // With an output Surface, the decoded frame never lands in an accessible
+                    // ByteBuffer — bufferInfo.size is 0 for a real frame just as often as for an
+                    // empty one, so gating "render" on size > 0 silently drops nearly every frame
+                    // (the encoder's input surface gets almost nothing, and the muxed output ends
+                    // up with a video track that has no real codec data — no avc1/csd, empty
+                    // stsd — while the copied-through audio track is fine, which is exactly why
+                    // the exported file was being misidentified as audio-only downstream). Render
+                    // every frame that isn't the empty end-of-stream marker.
+                    decoder.releaseOutputBuffer(outIndex, !eos)
                     if (eos) {
                         encoder.signalEndOfInputStream()
                         decoderDone = true
-                    } else if (durationUs > 0) {
-                        onProgress((bufferInfo.presentationTimeUs.toFloat() / durationUs).coerceIn(0f, 0.95f))
+                    } else {
+                        decoderFramesRendered++
+                        if (durationUs > 0) {
+                            onProgress((bufferInfo.presentationTimeUs.toFloat() / durationUs).coerceIn(0f, 0.95f))
+                        }
                     }
                 }
             }
@@ -110,6 +153,7 @@ class VideoCompressor(private val context: Context) {
                 when {
                     encIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> encoderOutputAvailable = false
                     encIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        android.util.Log.d("Featherize", "encoder format changed: ${encoder.outputFormat}")
                         muxerVideoTrack = muxer.addTrack(encoder.outputFormat)
                         if (audioTrackIndex >= 0) {
                             muxerAudioTrack = muxer.addTrack(extractor.getTrackFormat(audioTrackIndex))
@@ -120,10 +164,12 @@ class VideoCompressor(private val context: Context) {
                     encIndex >= 0 -> {
                         val encodedData = encoder.getOutputBuffer(encIndex)!!
                         if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                            android.util.Log.d("Featherize", "codec config buffer, size=${bufferInfo.size}")
                             bufferInfo.size = 0
                         }
                         if (bufferInfo.size > 0 && muxerStarted) {
                             muxer.writeSampleData(muxerVideoTrack, encodedData, bufferInfo)
+                            videoSamplesWritten++
                         }
                         val eos = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                         encoder.releaseOutputBuffer(encIndex, false)
@@ -141,6 +187,10 @@ class VideoCompressor(private val context: Context) {
         inputSurface.release()
         extractor.unselectTrack(videoTrackIndex)
 
+        android.util.Log.d(
+            "Featherize",
+            "decoderFramesRendered=$decoderFramesRendered videoSamplesWritten=$videoSamplesWritten muxerVideoTrack=$muxerVideoTrack",
+        )
         check(muxerStarted) { "Échec de l'encodage : aucun flux vidéo produit" }
 
         if (audioTrackIndex >= 0) {

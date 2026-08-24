@@ -11,8 +11,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.featherize.app.data.ExportMode
 import com.featherize.app.data.MediaRepository
-import com.featherize.app.data.batchWriteIntentSender
 import com.featherize.app.data.recoverableWriteIntentSender
+import com.featherize.app.data.trashRequestIntentSender
 import com.featherize.app.domain.CompressionPreset
 import com.featherize.app.domain.CompressionStatus
 import com.featherize.app.domain.GalleryMedia
@@ -191,21 +191,6 @@ class CompressionViewModel(
         _uiState.update { it.copy(isExporting = true) }
         viewModelScope.launch {
             try {
-                // Android 11+ can ask for write access to every replaced file in one dialog, instead
-                // of a RecoverableSecurityException prompt per item — and with "all files access"
-                // granted, no prompt is needed at all.
-                val needsConsent = mode == ExportMode.REPLACE &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
-                    !repository.hasManageExternalStorage()
-                if (needsConsent) {
-                    val granted = requestBatchWriteConsent(doneItems.map { it.uri })
-                    if (!granted) {
-                        doneItems.forEach { item ->
-                            updateItem(item.uri) { it.copy(errorMessage = "Permission refusée pour modifier ces fichiers") }
-                        }
-                        return@launch
-                    }
-                }
                 for (item in doneItems) {
                     val file = item.compressedFile ?: continue
                     exportOne(item, file, mode)
@@ -222,62 +207,76 @@ class CompressionViewModel(
         }
     }
 
-    private suspend fun requestBatchWriteConsent(uris: List<Uri>): Boolean {
-        val intentSender = try {
-            batchWriteIntentSender(getApplication(), uris)
-        } catch (t: Throwable) {
-            Log.e(TAG, "batch write request failed, falling back to per-item prompts", t)
-            return true
-        }
-        Log.d(TAG, "requesting batch write consent for ${uris.size} file(s)")
-        val deferred = CompletableDeferred<Boolean>()
-        pendingWritePermission = deferred
-        _writePermissionRequest.emit(IntentSenderRequest.Builder(intentSender).build())
-        return deferred.await()
-    }
-
+    /**
+     * Writes the compressed file as a brand new MediaStore item — this alone is what
+     * [CompressionStatus.EXPORTED] means, and it never touches the original. For
+     * [ExportMode.REPLACE], the original is trashed only afterward, as a separate best-effort
+     * step ([trashOriginalAfterExport]): if that fails or is denied, the export still counts as
+     * successful — the user keeps both files rather than losing the original, which is what a
+     * prior version of this code risked (see [MediaRepository.export]).
+     */
     private suspend fun exportOne(item: MediaItem, file: java.io.File, mode: ExportMode) {
         try {
-            val resultUri = withContext(Dispatchers.IO) { repository.export(item, file, mode) }
+            val resultUri = withContext(Dispatchers.IO) { repository.export(item, file) }
             Log.d(TAG, "exported ${item.displayName} -> $resultUri")
             file.delete()
             updateItem(item.uri) {
                 it.copy(status = CompressionStatus.EXPORTED, resultUri = resultUri, compressedFile = null)
             }
+            if (mode == ExportMode.REPLACE) {
+                trashOriginalAfterExport(item)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "export failed for ${item.displayName}", t)
+            updateItem(item.uri) { it.copy(errorMessage = t.message ?: "Échec de l'export") }
+        }
+    }
+
+    /**
+     * Best-effort: moves the original to the system trash (API 30+) so it's recoverable from
+     * Gallery/Photos for ~30 days even if this whole flow, or the platform's consent dialog,
+     * misbehaves — a hard, unrecoverable delete is never issued from here.
+     */
+    private suspend fun trashOriginalAfterExport(item: MediaItem) {
+        try {
+            withContext(Dispatchers.IO) { repository.trashOriginal(item.uri) }
+            Log.d(TAG, "trashed original for ${item.displayName}")
         } catch (e: SecurityException) {
-            val intentSender = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                recoverableWriteIntentSender(e)
-            } else {
-                null
+            val intentSender = when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ->
+                    try {
+                        trashRequestIntentSender(getApplication(), item.uri)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "trash request failed for ${item.displayName}", t)
+                        null
+                    }
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> recoverableWriteIntentSender(e)
+                else -> null
             }
             if (intentSender == null) {
-                Log.e(TAG, "export denied for ${item.displayName}, no recovery available", e)
-                updateItem(item.uri) { it.copy(errorMessage = "Permission refusée pour modifier ce fichier") }
+                Log.w(TAG, "could not trash original for ${item.displayName}, no recovery available", e)
                 return
             }
-            Log.d(TAG, "requesting write consent for ${item.displayName}")
+            Log.d(TAG, "requesting trash consent for ${item.displayName}")
             val deferred = CompletableDeferred<Boolean>()
             pendingWritePermission = deferred
             _writePermissionRequest.emit(IntentSenderRequest.Builder(intentSender).build())
             val granted = deferred.await()
             if (!granted) {
-                updateItem(item.uri) { it.copy(errorMessage = "Permission refusée pour modifier ce fichier") }
+                Log.w(TAG, "trash consent denied for ${item.displayName}, original kept")
                 return
             }
-            try {
-                val resultUri = withContext(Dispatchers.IO) { repository.export(item, file, mode) }
-                Log.d(TAG, "exported after consent ${item.displayName} -> $resultUri")
-                file.delete()
-                updateItem(item.uri) {
-                    it.copy(status = CompressionStatus.EXPORTED, resultUri = resultUri, compressedFile = null)
+            // MediaStore.createTrashRequest performs the trashing itself once granted (unlike
+            // the write-request flow) — nothing left to do here on success, on API 30+.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                try {
+                    withContext(Dispatchers.IO) { repository.trashOriginal(item.uri) }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "trash retry failed for ${item.displayName}, original kept", t)
                 }
-            } catch (t: Throwable) {
-                Log.e(TAG, "export retry failed for ${item.displayName}", t)
-                updateItem(item.uri) { it.copy(errorMessage = t.message ?: "Échec de l'export") }
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "export failed for ${item.displayName}", t)
-            updateItem(item.uri) { it.copy(errorMessage = t.message ?: "Échec de l'export") }
+            Log.w(TAG, "trash failed for ${item.displayName}, original kept", t)
         }
     }
 

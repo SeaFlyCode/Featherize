@@ -27,12 +27,14 @@ fun recoverableWriteIntentSender(e: SecurityException): IntentSender? =
     (e as? RecoverableSecurityException)?.userAction?.actionIntent?.intentSender
 
 /**
- * Requests write access for every [uris] in a single system consent dialog, instead of
- * one [RecoverableSecurityException] prompt per file. Android 11+ only.
+ * Requests permission to move a single MediaStore item the app doesn't own to the system trash
+ * (API 30+; recoverable there for ~30 days from the Gallery/Photos app, unlike a hard delete).
+ * Used to remove the original after [MediaRepository.export] has already written a verified
+ * replacement, for [ExportMode.REPLACE] — never before.
  */
 @RequiresApi(Build.VERSION_CODES.R)
-fun batchWriteIntentSender(context: Context, uris: List<Uri>): IntentSender =
-    MediaStore.createWriteRequest(context.contentResolver, uris).intentSender
+fun trashRequestIntentSender(context: Context, uri: Uri): IntentSender =
+    MediaStore.createTrashRequest(context.contentResolver, listOf(uri), true).intentSender
 
 class MediaRepository(private val context: Context) {
 
@@ -126,49 +128,160 @@ class MediaRepository(private val context: Context) {
     }
 
     /**
-     * Publishes a compressed file back to shared storage via MediaStore.
-     * [replace] deletes/overwrites the original entry; otherwise a new item is created.
+     * Publishes a compressed file back to shared storage via MediaStore, always as a brand
+     * new item — the original is NEVER opened for writing here. A previous version used
+     * ContentResolver's "wt" (write-truncate) mode to overwrite the original in place for
+     * [ExportMode.REPLACE]; "wt" truncates the target immediately, before a single byte of the
+     * replacement is written, and ContentResolver offers no atomic swap for an existing
+     * MediaStore entry. Any failure mid-copy (disk full, process death, revoked permission)
+     * left the original truncated/corrupted with no way back — this caused real data loss.
+     * For [ExportMode.REPLACE], the caller ([CompressionViewModel.exportOne]) only trashes the
+     * original — via [trashOriginal] — after this call has returned a fully-written new item.
      */
-    fun export(item: MediaItem, compressedFile: File, mode: ExportMode): Uri {
+    fun export(item: MediaItem, compressedFile: File): Uri {
         if (!compressedFile.exists()) {
             error("Le fichier compressé a expiré, relance la compression")
         }
+        val mimeType = if (item.type == MediaType.IMAGE) "image/jpeg" else "video/mp4"
+        val displayName = compressedFile.name
+
+        // With "All files access" granted, write straight to the filesystem and trigger an
+        // explicit scan instead of going through MediaStore's insert()/FUSE write path. On this
+        // device (Samsung One UI, Android 16) that path was observed to create a real, fully
+        // written, correctly named file — but the MediaStore row for it vanished within ~1-2s of
+        // being indexed regardless of RELATIVE_PATH, IS_PENDING, or DATE_TAKEN being set, and
+        // regardless of HDR tone-mapping — every export mode hit it. A direct filesystem write +
+        // MediaScannerConnection scan is the classic pre-scoped-storage path and sidesteps
+        // whatever in that FUSE/insert pipeline was pruning the row.
+        if (hasManageExternalStorage()) {
+            return exportViaRawFile(item, compressedFile, mimeType, displayName)
+        }
+
         val resolver = context.contentResolver
         val collection = if (item.type == MediaType.IMAGE) {
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         } else {
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI
         }
-        val mimeType = if (item.type == MediaType.IMAGE) "image/jpeg" else "video/mp4"
-        val displayName = compressedFile.name
 
-        if (mode == ExportMode.REPLACE) {
-            // "wt" truncates the original immediately, so an interrupted write (disk full, app
-            // killed) can leave it corrupted. There's no atomic swap available through
-            // ContentResolver for an existing MediaStore entry, so the achievable mitigation is:
-            // don't delete compressedFile until the caller confirms EXPORTED (see
-            // CompressionViewModel.exportOne), giving a recovery path even if this throws.
-            try {
-                val out = resolver.openOutputStream(item.uri, "wt")
-                    ?: error("Impossible d'ouvrir le fichier original en écriture")
-                out.use { compressedFile.inputStream().use { input -> input.copyTo(it) } }
-            } catch (t: Throwable) {
-                throw IllegalStateException(
-                    "Échec du remplacement, l'original peut être corrompu. Le fichier compressé est " +
-                        "conservé et l'export sera retenté.",
-                    t,
-                )
-            }
-            return item.uri
+        // Without an explicit RELATIVE_PATH, MediaStore drops the new item into the collection's
+        // default bucket (Movies/, Pictures/) instead of the original's folder (DCIM/Camera,
+        // WhatsApp Video...) — the compressed file still exists, just not where the user expects
+        // to find it, which reads as "the video disappeared". RELATIVE_PATH only exists as a
+        // MediaStore column from API 29 (Q) on — querying it below that throws (unknown column).
+        val relativePath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            resolver.query(
+                item.uri,
+                arrayOf(MediaStore.MediaColumns.RELATIVE_PATH),
+                null, null, null,
+            )?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+        } else {
+            null
         }
 
+        // Without DATE_TAKEN, MediaProvider's Photo Picker sync ("PickerDbFacade") logs "Could
+        // not get first date taken millis" / "Unable to promote cloud media" for the new row and
+        // — on recent Android builds (observed on Android 16) — the row gets pruned from
+        // MediaStore entirely shortly after, while the file stays on disk untouched. MediaMuxer's
+        // output has no capture-date metadata for the retriever to read, so it must be supplied
+        // explicitly; fall back to the original's own DATE_TAKEN, or now if it has none either.
+        val dateTaken = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            resolver.query(
+                item.uri,
+                arrayOf(MediaStore.MediaColumns.DATE_TAKEN),
+                null, null, null,
+            )?.use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else null }
+        } else {
+            null
+        }
+
+        // IS_PENDING tells MediaProvider "not ready yet, don't scan/index or surface this in
+        // queries". Without it, some OEM MediaProvider forks (observed on Samsung One UI) scan
+        // the row as soon as it's inserted — while bytes are still being copied — read it as
+        // invalid/incomplete, and prune the DB row outright. The file survives on disk (findable
+        // by path) but is gone from MediaStore, which is exactly what reads as "the compressed
+        // video disappeared". Clearing the flag after the copy triggers a proper, complete scan.
         val values = android.content.ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
             put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            if (relativePath != null) put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            put(MediaStore.MediaColumns.DATE_TAKEN, dateTaken ?: System.currentTimeMillis())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         val newUri = resolver.insert(collection, values) ?: error("Impossible de créer le fichier exporté")
         val out = resolver.openOutputStream(newUri) ?: error("Impossible d'ouvrir le fichier exporté en écriture")
         out.use { compressedFile.inputStream().use { input -> input.copyTo(it) } }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val cleared = android.content.ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+            resolver.update(newUri, cleared, null, null)
+        }
         return newUri
+    }
+
+    /**
+     * Writes the compressed file directly to the filesystem (requires "All files access") and
+     * asks [MediaScannerConnection] to index it, instead of going through MediaStore's insert().
+     * See the comment at the [export] call site for why this path exists.
+     */
+    private fun exportViaRawFile(item: MediaItem, compressedFile: File, mimeType: String, displayName: String): Uri {
+        val relativePath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            context.contentResolver.query(
+                item.uri,
+                arrayOf(MediaStore.MediaColumns.RELATIVE_PATH),
+                null, null, null,
+            )?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+        } else {
+            null
+        }
+        val defaultDir = if (item.type == MediaType.IMAGE) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_MOVIES
+        val dir = File(Environment.getExternalStorageDirectory(), relativePath ?: defaultDir)
+        dir.mkdirs()
+        val destFile = File(dir, displayName)
+        compressedFile.copyTo(destFile, overwrite = true)
+
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var scannedUri: Uri? = null
+        android.media.MediaScannerConnection.scanFile(
+            context,
+            arrayOf(destFile.absolutePath),
+            arrayOf(mimeType),
+        ) { _, uri -> scannedUri = uri; latch.countDown() }
+        latch.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        val uri = scannedUri ?: error("Le scan média a échoué après l'export")
+
+        // The system scanner's own content sniffing sometimes misreads this app's muxed MP4s
+        // (observed: a real video track classified as audio/mp4, landing the row in the audio
+        // collection). Force it back to the correct type/collection by id via the Files
+        // provider, which spans all media types — best-effort, the file is still valid and
+        // findable even if this update is refused.
+        val id = ContentUris.parseId(uri)
+        try {
+            val fix = android.content.ContentValues().apply { put(MediaStore.MediaColumns.MIME_TYPE, mimeType) }
+            context.contentResolver.update(MediaStore.Files.getContentUri("external", id), fix, null, null)
+        } catch (t: Throwable) {
+            // Best-effort: leave the row under whatever type the scanner picked.
+        }
+        return uri
+    }
+
+    /**
+     * Removes the original item after [export] has produced a verified replacement — the only
+     * point at which [ExportMode.REPLACE] is allowed to touch the source file. On API 30+ this
+     * moves it to the system trash (recoverable from Gallery/Photos for ~30 days) instead of
+     * deleting outright, via the [MediaStore.MediaColumns.IS_TRASHED] flag — [MediaStore] has no
+     * trash concept below API 30, so older devices fall back to a hard delete there. Throws
+     * [SecurityException] (recoverable via [trashRequestIntentSender] on API 30+, or the
+     * pre-30 [RecoverableSecurityException] path from [recoverableWriteIntentSender]) if the
+     * user hasn't granted access.
+     */
+    fun trashOriginal(uri: Uri) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val values = android.content.ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_TRASHED, 1)
+            }
+            context.contentResolver.update(uri, values, null, null)
+        } else {
+            context.contentResolver.delete(uri, null, null)
+        }
     }
 }
