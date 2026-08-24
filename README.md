@@ -48,4 +48,4 @@ L'app demande l'accès aux médias (`READ_MEDIA_IMAGES`, `READ_MEDIA_VIDEO`) et 
 
 ## Licence
 
-Distribué sous licence MIT — voir [LICENSE](LICENSE).
+Distribué sous licence [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) — voir [LICENSE](LICENSE). Usage et modification libres, republication des versions dérivées sous la même licence obligatoire, usage commercial soumis à autorisation.
